@@ -7,6 +7,22 @@ rioxarray.open_rasterio
 .. autofunction:: rioxarray.open_rasterio
 
 
+rioxarray.assets module
+-----------------------
+
+Remote assets (for example objects behind short-lived signed URLs) can be
+opened through a stable asset identity instead of a URL.  The identity is
+re-resolved to a current URL and open options every time a lazy task actually
+reads the asset, expired credentials are refreshed a bounded number of times,
+and the content version, grid and band schema are pinned so a new asset
+version can never be silently mixed into an ongoing computation.
+
+.. automodule:: rioxarray.assets
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+
 rioxarray.merge module
 ----------------------
 

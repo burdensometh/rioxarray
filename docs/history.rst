@@ -3,6 +3,15 @@ History
 
 Latest
 ------
+- ENH: Add the ``rioxarray.assets`` remote asset resolution interface.  Rasters
+  can now be opened from a stable ``AssetIdentity`` plus a
+  ``RemoteAssetResolver`` that supplies a current URL and open options when a
+  lazy task actually reads the data.  Expired credentials are refreshed a
+  bounded number of times with single-flight coordination across threads, the
+  content version/grid/band schema are pinned and re-checked on every re-open,
+  only the re-resolvable identity is serialized into Dask graphs, metadata and
+  read-window caches are partitioned by asset version, and resources opened for
+  a computation are released on close.  Plain local path usage is unchanged.
 
 
 0.24.0

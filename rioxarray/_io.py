@@ -37,6 +37,12 @@ from rioxarray._spatial_utils import (
     UNWANTED_RIO_ATTRS,
     _generate_spatial_coords,
 )
+from rioxarray.assets import (
+    AssetIdentity,
+    AssetURIManager,
+    RemoteAssetResolver,
+    is_remote_asset,
+)
 from rioxarray.exceptions import RioXarrayError
 
 # TODO: should this be GDAL_LOCK instead?
@@ -420,15 +426,24 @@ class RasterioArrayWrapper(BackendArray):
             out = numpy.zeros(shape, dtype=self.dtype)
         else:
             with self.lock:
-                riods = _ensure_warped_vrt(
-                    self.manager.acquire(needs_lock=False), self.vrt_params
-                )
-                out = riods.read(band_key, window=window, masked=self.masked)
+                if isinstance(self.manager, AssetURIManager):
+                    # The asset manager performs the (possibly retried) open
+                    # and keeps the window cache namespaced by content
+                    # version, so a refresh can never mix pixel versions.
+                    out = self.manager.read_window(
+                        band_key, window, masked=self.masked
+                    )
+                else:
+                    riods = _ensure_warped_vrt(
+                        self.manager.acquire(needs_lock=False), self.vrt_params
+                    )
+                    out = riods.read(band_key, window=window, masked=self.masked)
                 if self._unsigned_dtype is not None:
                     out = out.astype(self._unsigned_dtype)
                 if self.masked:
                     out = numpy.ma.filled(out.astype(self.dtype), self.fill_value)
                 if self.mask_and_scale:
+                    riods = self.manager.acquire(needs_lock=False)
                     if not isinstance(band_key, Iterable):
                         out = (
                             out * riods.scales[band_key - 1]
@@ -895,7 +910,7 @@ def _prepare_dask(
     *,
     result: DataArray,
     riods: RasterioReader,
-    filename: Union[str, os.PathLike],
+    filename: Union[str, os.PathLike, AssetIdentity],
     chunks: Union[int, tuple, dict],
     bidx: Optional[int] = None,
 ) -> DataArray:
@@ -905,12 +920,23 @@ def _prepare_dask(
     # pylint: disable=import-outside-toplevel
     from dask.base import tokenize
 
-    # augment the token with the file modification time
-    try:
-        mtime = os.path.getmtime(filename)
-    except (TypeError, OSError):
-        # the filename is probably an s3 bucket rather than a regular file
+    if isinstance(filename, AssetIdentity):
+        # Remote assets: key the graph on the stable identity and the pinned
+        # content version rather than on a URL that may be refreshed.
         mtime = None
+        token_source = (
+            filename.asset_id,
+            filename.version,
+            tuple(sorted(filename.extra)),
+        )
+    else:
+        # augment the token with the file modification time
+        try:
+            mtime = os.path.getmtime(filename)
+        except (TypeError, OSError):
+            # the filename is probably an s3 bucket rather than a regular file
+            mtime = None
+        token_source = filename
 
     if chunks in (True, "auto"):
         from dask.array.core import normalize_chunks
@@ -925,9 +951,9 @@ def _prepare_dask(
         # xarray wants chunks as a dict rather than a tuple
         chunks = dict(zip(result.dims, chunks, strict=True))  # type: ignore[arg-type]
 
-    token_filename = filename
+    token_filename = token_source
     if bidx is not None:
-        token_filename = f"{filename}-{bidx}"
+        token_filename = f"{token_source}-{bidx}"
     token = tokenize(token_filename, mtime, chunks)
     name_prefix = f"open_rasterio-{token}"
     return result.chunk(chunks, name_prefix=name_prefix, token=token)
@@ -993,6 +1019,7 @@ def open_rasterio(
         rasterio.io.DatasetReader,
         rasterio.vrt.WarpedVRT,
         SingleBandDatasetReader,
+        AssetIdentity,
     ],
     *,
     parse_coordinates: Optional[bool] = None,
@@ -1007,6 +1034,9 @@ def open_rasterio(
     decode_times: bool = True,
     decode_timedelta: Optional[bool] = None,
     band_as_variable: bool = False,
+    asset_resolver: Optional[RemoteAssetResolver] = None,
+    max_refreshes: int = 2,
+    window_cache_size: int = 0,
     **open_kwargs,
 ) -> Union[Dataset, DataArray, list[Dataset]]:
     # pylint: disable=too-many-statements,too-many-locals,too-many-branches
@@ -1074,6 +1104,23 @@ def open_rasterio(
         If None (default), assume the same value of decode_time.
     band_as_variable: bool, default=False
         If True, will load bands in a raster to separate variables.
+    asset_resolver: RemoteAssetResolver, optional
+        Required when ``filename`` is an
+        :class:`~rioxarray.assets.AssetIdentity`.  The resolver turns the
+        stable asset identity into a current URL and open options every time
+        a lazy task actually opens the asset, so expired signed URLs are
+        transparently refreshed (up to ``max_refreshes`` times).  The content
+        version, grid and band schema observed at the first open are pinned
+        and re-checked on every re-open; a mismatch raises an error instead
+        of mixing pixels from a new asset version into the computation.
+    max_refreshes: int, default=2
+        Maximum number of credential refreshes attempted for a remote asset
+        before :class:`~rioxarray.assets.AssetResolutionError` is raised.
+    window_cache_size: int, default=0
+        LRU size of the per-asset-version read-window cache used by the
+        remote asset manager.  ``0`` (the default) disables it.  Entries are
+        always namespaced by content version, so a refreshed URL can never
+        serve cached pixels from another version.
     **open_kwargs: kwargs, optional
         Optional keyword arguments to pass into :func:`rasterio.open`.
 
@@ -1086,29 +1133,55 @@ def open_rasterio(
     masked = masked or mask_and_scale
     vrt_params = None
     file_opener = rasterio.open
-    if isinstance(filename, SingleBandDatasetReader):
-        file_opener = _single_band_open
-        open_kwargs.update(bidx=filename._bidx)
-        vrt_params = filename._vrt_params
-    if isinstance(filename, (rasterio.io.DatasetReader, SingleBandDatasetReader)):
-        filename = filename.name
-    elif isinstance(filename, rasterio.vrt.WarpedVRT):
-        vrt = filename
-        filename = vrt.src_dataset.name
-        vrt_params = {
-            "src_crs": vrt.src_crs.to_string() if vrt.src_crs else None,
-            "crs": vrt.dst_crs.to_string() if vrt.dst_crs else None,
-            "resampling": vrt.resampling,
-            "tolerance": vrt.tolerance,
-            "src_nodata": vrt.src_nodata,
-            "nodata": vrt.dst_nodata,
-            "width": vrt.dst_width,
-            "height": vrt.dst_height,
-            "src_transform": vrt.src_transform,
-            "transform": vrt.dst_transform,
-            "dtype": vrt.working_dtype,
-            **vrt.warp_extras,
-        }
+
+    # Remote assets are addressed by a stable, re-resolvable identity rather
+    # than by a (potentially expired) URL.  Everything below that needs a
+    # path works through ``path_arg`` while ``filename`` keeps the identity
+    # for encoding/Dask tokenization.
+    remote_asset = is_remote_asset(filename)
+    if remote_asset:
+        if asset_resolver is None:
+            raise RioXarrayError(
+                "An 'asset_resolver' is required when opening an "
+                "AssetIdentity. Pass a RemoteAssetResolver instance to "
+                "open_rasterio()."
+            )
+        asset_identity: AssetIdentity = filename  # type: ignore[assignment]
+        path_arg: Union[str, "os.PathLike[str]", AssetIdentity] = asset_identity
+        reader_wrapper = None
+    else:
+        asset_identity = None  # type: ignore[assignment]
+        if isinstance(filename, SingleBandDatasetReader):
+            file_opener = _single_band_open
+            open_kwargs.update(bidx=filename._bidx)
+            vrt_params = filename._vrt_params
+        if isinstance(
+            filename, (rasterio.io.DatasetReader, SingleBandDatasetReader)
+        ):
+            filename = filename.name
+        elif isinstance(filename, rasterio.vrt.WarpedVRT):
+            vrt = filename
+            filename = vrt.src_dataset.name
+            vrt_params = {
+                "src_crs": vrt.src_crs.to_string() if vrt.src_crs else None,
+                "crs": vrt.dst_crs.to_string() if vrt.dst_crs else None,
+                "resampling": vrt.resampling,
+                "tolerance": vrt.tolerance,
+                "src_nodata": vrt.src_nodata,
+                "nodata": vrt.dst_nodata,
+                "width": vrt.dst_width,
+                "height": vrt.dst_height,
+                "src_transform": vrt.src_transform,
+                "transform": vrt.dst_transform,
+                "dtype": vrt.working_dtype,
+                **vrt.warp_extras,
+            }
+        path_arg = filename
+        reader_wrapper = (
+            (lambda riods: _ensure_warped_vrt(riods, vrt_params))
+            if vrt_params is not None
+            else None
+        )
 
     if lock in (True, None):
         lock = RASTERIO_LOCK
@@ -1120,8 +1193,19 @@ def open_rasterio(
     open_kwargs["sharing"] = open_kwargs.get("sharing", False)
 
     with warnings.catch_warnings(record=True) as rio_warnings:
-        if lock is not NO_LOCK and isinstance(filename, (str, os.PathLike)):
-            manager: FileManager = CachingFileManager(
+        if remote_asset:
+            manager = AssetURIManager(
+                asset_identity,
+                asset_resolver,
+                file_opener,
+                mode="r",
+                kwargs=open_kwargs,
+                reader_wrapper=reader_wrapper,
+                max_refreshes=max_refreshes,
+                window_cache_size=window_cache_size,
+            )
+        elif lock is not NO_LOCK and isinstance(filename, (str, os.PathLike)):
+            manager: Union[FileManager, AssetURIManager] = CachingFileManager(
                 file_opener, filename, lock=lock, mode="r", kwargs=open_kwargs  # type: ignore[arg-type]
             )
         else:
@@ -1138,6 +1222,13 @@ def open_rasterio(
 
     # open the subdatasets if they exist
     if riods.subdatasets:
+        if remote_asset:
+            raise RioXarrayError(
+                "Remote asset identities cannot be combined with container "
+                "datasets exposing subdatasets (e.g. HDF/NetCDF). Resolve "
+                "the individual subdataset to its own AssetIdentity and open "
+                "that instead."
+            )
         subdataset_result = _load_subdatasets(
             riods=riods,
             group=group,
@@ -1283,7 +1374,7 @@ def open_rasterio(
         result = _prepare_dask(
             result=result,
             riods=riods,
-            filename=filename,
+            filename=path_arg,
             chunks=chunks,
             bidx=open_kwargs.get("bidx"),
         )
@@ -1294,9 +1385,15 @@ def open_rasterio(
             coord_name: 1,
         }
 
-    # add file path to encoding
-    result.encoding["source"] = riods.name
+    # add file path to encoding.  For remote assets store the stable
+    # identity rather than the (refreshable) signed URL or a live handle.
+    if remote_asset:
+        result.encoding["source"] = asset_identity
+    else:
+        result.encoding["source"] = riods.name
     result.encoding["rasterio_dtype"] = str(riods.dtypes[0])
+    if remote_asset and manager.pinned_version is not None:
+        result.encoding["asset_version"] = manager.pinned_version
     # remove duplicate coordinate information
     for coord in result.coords:
         result.attrs = {
