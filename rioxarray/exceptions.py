@@ -45,3 +45,7 @@ class CoordinateDimensionError(RioXarrayError):
 
 class MissingCRS(RioXarrayError):
     """Missing the CRS in the dataset."""
+
+
+class QualityLayerError(RioXarrayError, ValueError):
+    """The quality layer does not match the data it is meant to rank."""

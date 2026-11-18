@@ -14,6 +14,8 @@ rioxarray.merge module
 
 .. autofunction:: rioxarray.merge.merge_datasets
 
+.. autofunction:: rioxarray.merge.merge_datasets_quality
+
 
 rioxarray.set_options
 -----------------------

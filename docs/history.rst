@@ -3,6 +3,12 @@ History
 
 Latest
 ------
+- ENH: Add quality-priority merging with ``merge_datasets_quality`` (also
+  ``merge_datasets(..., quality=...)``). A single source supplies every band
+  of each output pixel; sources are ranked by a quality layer, then a declared
+  priority, with stable ties. Results include ``source_index``/``source_valid``
+  and survive ``rio.clip`` and ``rio.to_raster``. The quality layer is never
+  interpolated.
 
 
 0.24.0
