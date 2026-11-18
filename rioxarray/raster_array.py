@@ -12,6 +12,7 @@ datacube is licensed under the Apache License, Version 2.0:
 
 import copy
 import os
+import warnings
 from collections.abc import Generator, Hashable, Iterable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -47,6 +48,7 @@ from rioxarray.exceptions import (
     OneDimensionalRaster,
     RioXarrayError,
 )
+from rioxarray import _warp
 from rioxarray.raster_writer import RasterioWriter, _ensure_nodata_dtype
 from rioxarray.rioxarray import XRasterBase
 
@@ -204,6 +206,9 @@ class RasterArray(XRasterBase):
         transform: Optional[Affine] = None,
         resampling: Optional[Union[Resampling, str]] = Resampling.nearest,
         nodata: Optional[float] = None,
+        chunks: Optional[
+            Union[int, tuple[int, ...], dict[Hashable, int], Literal["auto"]]
+        ] = None,
         **kwargs,
     ) -> xarray.DataArray:
         """
@@ -216,13 +221,22 @@ class RasterArray(XRasterBase):
             a 'crs' attribute to be set containing a valid CRS.
             If using a WKT (e.g. from spatiareference.org), make sure it is an OGC WKT.
 
-        .. note:: To re-project with dask, see
+        .. note:: Dask-backed DataArrays are reprojected lazily, one output
+            block at a time: the destination grid is determined without reading
+            pixels and each output chunk then loads only the overlapping source
+            window, including a resampling halo and proper nodata masking.
+            Pass ``chunks`` to control the output chunk size. The lazy path
+            requires a regular affine transform; inputs georeferenced with GCPs,
+            RPCs or ``src_geoloc_array`` fall back to the in-memory path.
+            For alternative dask implementations see
             `odc-geo <https://odc-geo.readthedocs.io/>`__ &
             `pyresample <https://pyresample.readthedocs.io/>`__.
 
         .. versionadded:: 0.0.27 shape
         .. versionadded:: 0.0.28 transform
         .. versionadded:: 0.5.0 nodata, kwargs
+        .. versionadded:: 0.25.0 chunks (lazy, windowed reprojection of
+            dask-backed DataArrays)
 
         Parameters
         ----------
@@ -244,6 +258,15 @@ class RasterArray(XRasterBase):
             it will remain in all areas not covered by the reprojected source.
             Defaults to the nodata value of the source image if none provided
             and exists or attempts to find an appropriate value by dtype.
+        chunks: int, tuple, dict or "auto", optional
+            Chunking of the reprojected output. When the input is dask-backed
+            the reprojection is executed lazily in windows: the destination
+            grid (transform, shape and CRS) is computed once without reading
+            any pixels, and each output block reads only the source window it
+            overlaps (plus the resampling halo) when the dask graph is
+            computed. All blocks share sub-windows of the same destination
+            transform, so results are seamless and match a whole-array warp.
+            Defaults to the input chunking on the spatial axes.
         **kwargs: dict
             Additional keyword arguments to pass into :func:`rasterio.warp.reproject`.
             To override:
@@ -273,14 +296,33 @@ class RasterArray(XRasterBase):
         # Get source data from inputs
         src_affine, use_affine = self._reproj_get_src(**kwargs)
 
-        # Get destination data from inputs
-        dst_data, dst_height, dst_width, dst_affine, dst_nodata = self._reproj_get_dst(
+        # Determine the single destination grid up front, without reading
+        # any source pixels.
+        dst_affine, dst_height, dst_width, dst_nodata = self._reproj_get_dst_grid(
             dst_crs=dst_crs,
             resolution=resolution,
             shape=shape,
             transform=transform,
             nodata=nodata,
             **kwargs,
+        )
+
+        if chunks is not None or _warp.supports_lazy_path(self._obj, kwargs):
+            return self._reproject_lazy(
+                dst_crs=dst_crs,
+                dst_affine=dst_affine,
+                dst_height=dst_height,
+                dst_width=dst_width,
+                dst_nodata=dst_nodata,
+                src_affine=src_affine,
+                resampling=resampling,
+                chunks=chunks,
+                use_affine=use_affine,
+                kwargs=kwargs,
+            )
+
+        dst_data = self._create_dst_data(
+            dst_height=dst_height, dst_width=dst_width
         )
 
         # Do the reprojection using rasterio
@@ -352,6 +394,89 @@ class RasterArray(XRasterBase):
 
         return xda
 
+    def _reproject_lazy(
+        self,
+        *,
+        dst_crs: Any,
+        dst_affine: Affine,
+        dst_height: int,
+        dst_width: int,
+        dst_nodata: float,
+        src_affine: Optional[Affine],
+        resampling: Resampling,
+        chunks: Any,
+        use_affine: bool,
+        kwargs: dict[str, Any],
+    ) -> xarray.DataArray:
+        """Build (and wrap) the lazy windowed reprojection dask graph."""
+        if not _warp.supports_lazy_path(self._obj, kwargs):
+            warnings.warn(
+                "The 'chunks' argument of 'rio.reproject' only enables the "
+                "lazy windowed path for dask-backed DataArrays with a regular "
+                "affine transform (GCPs, RPCs and src_geoloc_array are not "
+                "supported). Falling back to the in-memory reprojection.",
+                stacklevel=3,
+            )
+            dst_data = self._create_dst_data(
+                dst_height=dst_height, dst_width=dst_width
+            )
+            rasterio.warp.reproject(
+                source=self._obj.values,
+                destination=dst_data,
+                src_transform=src_affine,
+                src_crs=self.crs,
+                src_nodata=self.nodata,
+                dst_transform=dst_affine,
+                dst_crs=dst_crs,
+                dst_nodata=dst_nodata,
+                resampling=resampling,
+                **kwargs,
+            )
+            return self._reproj_convert_to_xarray(
+                dst_data=dst_data,
+                dst_nodata=dst_nodata,
+                dst_affine=dst_affine,
+                dst_width=dst_width,
+                dst_height=dst_height,
+                dst_crs=dst_crs,
+                use_affine=use_affine,
+            )
+
+        if chunks is None:
+            chunks = self._default_reproject_chunks()
+        dst_data = _warp.reproject_lazy(
+            self._obj,
+            dst_crs=dst_crs,
+            dst_affine=dst_affine,
+            dst_height=dst_height,
+            dst_width=dst_width,
+            dst_nodata=dst_nodata,
+            src_affine=src_affine,
+            src_nodata=self.nodata,
+            resampling=resampling,
+            chunks=chunks,
+            warp_kwargs=kwargs,
+        )
+        return self._reproj_convert_to_xarray(
+            dst_data=dst_data,
+            dst_nodata=dst_nodata,
+            dst_affine=dst_affine,
+            dst_width=dst_width,
+            dst_height=dst_height,
+            dst_crs=dst_crs,
+            use_affine=use_affine,
+        )
+
+    def _default_reproject_chunks(self) -> dict[Hashable, Any]:
+        """Default output chunks: reuse the source spatial chunk sizes."""
+        chunks: dict[Hashable, Any] = {}
+        for dim, sizes in zip(self._obj.dims, self._obj.data.chunks, strict=True):
+            chunks[dim] = max(int(size) for size in sizes)
+        return {
+            "y": chunks.get(self.y_dim, "auto"),
+            "x": chunks.get(self.x_dim, "auto"),
+        }
+
     def _reproj_update_kwargs(self, **kwargs):
         """Helper function updating kwargs from internal members"""
         gcps = self.get_gcps()
@@ -374,7 +499,7 @@ class RasterArray(XRasterBase):
         src_affine = None if not use_affine else self.transform(recalc=True)
         return src_affine, use_affine
 
-    def _reproj_get_dst(
+    def _reproj_get_dst_grid(
         self,
         *,
         dst_crs: Any,
@@ -384,7 +509,12 @@ class RasterArray(XRasterBase):
         nodata: Optional[float] = None,
         **kwargs,
     ):
-        """Helper function creating destination data from inputs"""
+        """
+        Determine the unique destination grid (transform, size and nodata).
+
+        No destination pixel buffer is allocated, so this is safe to call on
+        very large or dask-backed arrays without reading their data.
+        """
         if transform is None:
             dst_affine, dst_width, dst_height = _make_dst_affine(
                 src_data_array=self._obj,
@@ -401,9 +531,30 @@ class RasterArray(XRasterBase):
             else:
                 dst_height, dst_width = self.shape
 
-        dst_data = self._create_dst_data(dst_height=dst_height, dst_width=dst_width)
         dst_nodata = self._get_dst_nodata(nodata)
 
+        return dst_affine, dst_height, dst_width, dst_nodata
+
+    def _reproj_get_dst(
+        self,
+        *,
+        dst_crs: Any,
+        resolution: Optional[Union[float, tuple[float, float]]] = None,
+        shape: Optional[tuple[int, int]] = None,
+        transform: Optional[Affine] = None,
+        nodata: Optional[float] = None,
+        **kwargs,
+    ):
+        """Helper function creating destination data from inputs"""
+        dst_affine, dst_height, dst_width, dst_nodata = self._reproj_get_dst_grid(
+            dst_crs=dst_crs,
+            resolution=resolution,
+            shape=shape,
+            transform=transform,
+            nodata=nodata,
+            **kwargs,
+        )
+        dst_data = self._create_dst_data(dst_height=dst_height, dst_width=dst_width)
         return dst_data, dst_height, dst_width, dst_affine, dst_nodata
 
     def _get_dst_nodata(self, nodata: Optional[float]) -> Optional[float]:

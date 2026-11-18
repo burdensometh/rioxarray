@@ -3,6 +3,11 @@ History
 
 Latest
 ------
+- ENH: ``rio.reproject`` reprojects dask-backed DataArrays lazily, one output
+  block at a time, via the new ``chunks`` argument. The destination grid is
+  determined without reading pixels and each output block loads only the
+  overlapping source window (with resampling halo and nodata/mask padding);
+  blocks share sub-windows of a single destination transform to avoid seams.
 
 
 0.24.0

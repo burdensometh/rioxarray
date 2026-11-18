@@ -65,6 +65,7 @@ class RasterDataset(XRasterBase):
         transform: Optional[Affine] = None,
         resampling: Optional[Union[Resampling, str]] = Resampling.nearest,
         nodata: Optional[float] = None,
+        chunks: Optional[Any] = None,
         **kwargs,
     ) -> xarray.Dataset:
         """
@@ -76,13 +77,14 @@ class RasterDataset(XRasterBase):
             a 'crs' attribute to be set containing a valid CRS.
             If using a WKT (e.g. from spatiareference.org), make sure it is an OGC WKT.
 
-        .. note:: To re-project with dask, see
-            `odc-geo <https://odc-geo.readthedocs.io/>`__ &
-            `pyresample <https://pyresample.readthedocs.io/>`__.
+        .. note:: Dask-backed variables are reprojected lazily, one output
+            block at a time; see :meth:`RasterArray.reproject` and its
+            ``chunks`` argument for details.
 
         .. versionadded:: 0.0.27 shape
         .. versionadded:: 0.0.28 transform
         .. versionadded:: 0.5.0 nodata, kwargs
+        .. versionadded:: 0.25.0 chunks
 
         Parameters
         ----------
@@ -104,6 +106,10 @@ class RasterDataset(XRasterBase):
             it will remain in all areas not covered by the reprojected source.
             Defaults to the nodata value of the source image if none provided
             and exists or attempts to find an appropriate value by dtype.
+        chunks: int, tuple, dict or "auto", optional
+            Chunking of the reprojected output; enables the lazy windowed
+            path for dask-backed variables. See
+            :meth:`RasterArray.reproject`.
         **kwargs: dict
             Additional keyword arguments to pass into :func:`rasterio.warp.reproject`.
             To override:
@@ -130,6 +136,7 @@ class RasterDataset(XRasterBase):
                         transform=transform,
                         resampling=resampling,
                         nodata=nodata,
+                        chunks=chunks,
                         **kwargs,
                     )
                 )
